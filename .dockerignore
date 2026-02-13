@@ -1,0 +1,36 @@
+# ── Secrets (NEVER include in images) ──
+.env
+.env.*
+!.env.example
+
+# ── Development artifacts ──
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+
+# ── Version control ──
+.git/
+.gitignore
+
+# ── IDE ──
+.vscode/
+.idea/
+*.swp
+
+# ── Docker (avoid recursive builds) ──
+Dockerfile
+docker-compose*.yml
+.dockerignore
+
+# ── Docs ──
+README.md
+LICENSE
+docs/
+.DS_Store
+Thumbs.db

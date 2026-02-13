@@ -1,0 +1,54 @@
+# docker-compose.yml
+# Local development stack for the Bitbucket MCP Server
+# Usage: docker compose up --build
+
+services:
+  bitbucket-mcp-pilot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      # ── Bitbucket OAuth (load from .env file) ──
+      BITBUCKET_CLIENT_ID: ${BITBUCKET_CLIENT_ID}
+      BITBUCKET_CLIENT_SECRET: ${BITBUCKET_CLIENT_SECRET}
+      AUTH_MODE: "none" # Local dev only
+
+      # ── Server config ──
+      MCP_SERVER_HOST: "0.0.0.0"
+      MCP_SERVER_PORT: "8080"
+      LOG_LEVEL: "DEBUG" # Verbose for local dev
+
+      # ── Security ──
+      ALLOWED_ORIGINS: "*" # Local dev only
+
+    # Use .env file for secrets (never committed to git)
+    env_file:
+      - .env
+
+    # Restart on crash during development
+    restart: unless-stopped
+
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+        reservations:
+          cpus: "0.25"
+          memory: 128M
+
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
