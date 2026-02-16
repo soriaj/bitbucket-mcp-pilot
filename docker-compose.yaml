@@ -3,17 +3,19 @@
 # Usage: docker compose up --build
 
 services:
-  bitbucket-mcp-pilot:
+  bitbucket-mcp:
     build:
       context: .
       dockerfile: Dockerfile
+    # image: jasoria/bitbucket-mcp:v104
     ports:
       - "8080:8080"
     environment:
       # ── Bitbucket OAuth (load from .env file) ──
       BITBUCKET_CLIENT_ID: ${BITBUCKET_CLIENT_ID}
       BITBUCKET_CLIENT_SECRET: ${BITBUCKET_CLIENT_SECRET}
-      AUTH_MODE: "none" # Local dev only
+      AUTH_MODE: ${AUTH_MODE} # none = Local dev only / glean_only = from glean only
+      GLEAN_INSTANCE: ${GLEAN_INSTANCE}
 
       # ── Server config ──
       MCP_SERVER_HOST: "0.0.0.0"
@@ -21,7 +23,7 @@ services:
       LOG_LEVEL: "DEBUG" # Verbose for local dev
 
       # ── Security ──
-      ALLOWED_ORIGINS: "*" # Local dev only
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS} # Origin
 
     # Use .env file for secrets (never committed to git)
     env_file:

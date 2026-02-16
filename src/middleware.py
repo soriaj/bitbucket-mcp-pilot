@@ -66,28 +66,14 @@ class GleanAuthMiddleware(BaseHTTPMiddleware):
 
         token = auth_header[7:]
 
-        # ── Check 2: Validate request origin ──
-        if auth_mode == "glean_only":
-            origin_valid = self._check_request_origin(request)
-            if not origin_valid:
-                logger.warning(
-                    f"Rejected: Request not from allowed Glean "
-                    f"instance. Host: {request.client.host}, "
-                    f"User-Agent: {request.headers.get('user-agent')}"
-                )
-                return JSONResponse(
-                    status_code=403,
-                    content={"error": "Unauthorized origin"},
-                )
-
-        # ── Check 3: Token not empty/malformed ──
+        # ── Check 2: Token not empty/malformed ──
         if len(token) < 10:
             return JSONResponse(
                 status_code=401,
                 content={"error": "Invalid token format"},
             )
 
-        # ── Check 4: Token validation with caching ──
+        # ── Check 3: Token validation with caching ──
         token_hash = hashlib.sha256(token.encode()).hexdigest()[:16]
 
         if token_hash in self._validated_tokens:
@@ -111,6 +97,25 @@ class GleanAuthMiddleware(BaseHTTPMiddleware):
         # Cache valid token for 5 minutes
         self._validated_tokens[token_hash] = time.time() + 300
         self._cleanup_cache()
+
+        # return await call_next(request)
+        return await self._maybe_check_origin(request, call_next)
+
+    async def _maybe_check_origin(self, request: Request, call_next):
+        """Apply origin huristics only when configured."""
+
+        # Enforce orgin heuristics in glean_only mode
+        if self.settings.auth_mode == "glean_only":
+            if not self._check_request_origin(request):
+                logger.warning(
+                    "Rejected: Request failed origin heuristic check. "
+                    f"Client: {request.client.host}, "
+                    f"User-Agent: {request.headers.get('user-agent')}"
+                )
+                return JSONResponse(
+                    status_code=403,
+                    content={"error": "Unauthorized origin"},
+                )
 
         return await call_next(request)
 
