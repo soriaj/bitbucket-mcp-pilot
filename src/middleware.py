@@ -10,132 +10,152 @@ Three validation checks:
 
 import time
 import hashlib
+import json
 import logging
 import httpx
-from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.types import ASGIApp, Scope, Receive, Send
 from src.config import get_settings
 
 logger = logging.getLogger(__name__)
 
 
-class GleanAuthMiddleware(BaseHTTPMiddleware):
+class GleanAuthMiddleware:
     """
-    Validates that requests originate from the configured
-    Glean instance and carry a valid Bearer token.
+    Pure ASGI middleware that validates requests from the configured
+    Glean instance. Does NOT subclass BaseHTTPMiddleware — avoids
+    response buffering that breaks SSE streaming connections.
     """
 
-    def __init__(self, app):
-        super().__init__(app)
+    # Paths that bypass auth entirely:
+    #   /health  → Cloud Run / load balancer health checks
+    #   /sse     → SSE handshake (tool discovery ListToolsRequest comes here)
+    #   OPTIONS  → CORS preflight
+    SKIP_PATHS = {"/health", "/sse"}
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
         self.settings = get_settings()
         self._http = httpx.AsyncClient(timeout=10.0)
-        # Token validation cache: hash(token) → expiry timestamp
+
+        # Token validation cache: sha256(token)[:16] → expiry timestamp
+        # NOTE: per-instance cache. Acceptable for Cloud Run single-instance
+        # dev/demo deployments. For multi-instance prod, use Redis or similar.
         self._validated_tokens: dict[str, float] = {}
-        # Build the allowed origin pattern from glean_instance
+
+        # Allowed Glean backend host for origin heuristic checks
         self._allowed_glean_host = (
             f"{self.settings.glean_instance}-be.glean.com"
             if self.settings.glean_instance
             else None
         )
 
-    async def dispatch(self, request: Request, call_next):
-        # Skip auth for these paths:
-        # - /health  → load balancer health checks
-        # - /sse     → SSE connection + tool discovery
-        # - OPTIONS  → CORS preflight
-        skip_paths = {"/health", "/sse"}
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """
+        Pure ASGI entry point. Only intercepts HTTP requests.
+        WebSocket and lifespan scopes are passed straight through
+        without any response wrapping.
+        """
+        if scope["type"] != "http":
+            # Pass WebSocket / lifespan scopes through untouched
+            await self.app(scope, receive, send)
+            return
 
-        if request.url.path in skip_paths or request.method == "OPTIONS":
-            return await call_next(request)
+        request = Request(scope, receive)
 
-        auth_mode = self.settings.auth_mode
+        # ── Skip auth for health checks, SSE, and CORS preflight ──────────
+        if request.url.path in self.SKIP_PATHS or request.method == "OPTIONS":
+            await self.app(scope, receive, send)
+            return
 
-        # Development mode — no auth
-        if auth_mode == "none":
-            return await call_next(request)
+        # ── Development mode — bypass all auth ────────────────────────────
+        if self.settings.auth_mode == "none":
+            await self.app(scope, receive, send)
+            return
 
-        # ── Check 1: Bearer token present ──
+        # ── Check 1: Bearer token present ─────────────────────────────────
         auth_header = request.headers.get("Authorization", "")
         if not auth_header.startswith("Bearer "):
-            logger.warning(f"Rejected: No Bearer token from " f"{request.client.host}")
-            return JSONResponse(
-                status_code=401,
-                content={"error": "Bearer token required"},
+            logger.warning(
+                f"Rejected (no Bearer token): {request.client.host} "
+                f"→ {request.method} {request.url.path}"
             )
+            await self._send_json_response(
+                send, status=401, body={"error": "Bearer token required"}
+            )
+            return
 
         token = auth_header[7:]
 
-        # ── Check 2: Token not empty/malformed ──
+        # ── Check 2: Token not empty/malformed ────────────────────────────
         if len(token) < 10:
-            return JSONResponse(
-                status_code=401,
-                content={"error": "Invalid token format"},
+            await self._send_json_response(
+                send, status=401, body={"error": "Invalid token format"}
             )
+            return
 
-        # ── Check 3: Token validation with caching ──
-        token_hash = hashlib.sha256(token.encode()).hexdigest()[:16]
+        # ── Check 3: Token validation (with cache) ────────────────────────
+        token_hash = hashlib.sha256(token.encode()).hexdigest()[
+            :32
+        ]  # 32 chars for safety
+        now = time.time()
 
         if token_hash in self._validated_tokens:
-            if time.time() < self._validated_tokens[token_hash]:
-                # Cached valid token
-                return await call_next(request)
+            if now < self._validated_tokens[token_hash]:
+                # Cache hit — skip Bitbucket API call
+                pass
             else:
+                # Expired — remove and re-validate
                 del self._validated_tokens[token_hash]
+                if not await self._validate_token(token):
+                    logger.warning(f"Rejected (expired token): {request.client.host}")
+                    await self._send_json_response(
+                        send, status=403, body={"error": "Invalid or expired token"}
+                    )
+                    return
+                self._validated_tokens[token_hash] = now + 300
+        else:
+            # Cache miss — validate live against Bitbucket
+            if not await self._validate_token(token):
+                logger.warning(f"Rejected (invalid token): {request.client.host}")
+                await self._send_json_response(
+                    send, status=403, body={"error": "Invalid or expired token"}
+                )
+                return
+            self._validated_tokens[token_hash] = now + 300
 
-        # Validate token against Bitbucket (since Glean obtained
-        # a Bitbucket OAuth token via the OAuth flow you configured)
-        is_valid = await self._validate_token(token)
-
-        if not is_valid:
-            logger.warning(f"Rejected: Invalid token from " f"{request.client.host}")
-            return JSONResponse(
-                status_code=403,
-                content={"error": "Invalid or expired token"},
-            )
-
-        # Cache valid token for 5 minutes
-        self._validated_tokens[token_hash] = time.time() + 300
         self._cleanup_cache()
 
-        # return await call_next(request)
-        return await self._maybe_check_origin(request, call_next)
-
-    async def _maybe_check_origin(self, request: Request, call_next):
-        """Apply origin huristics only when configured."""
-
-        # Enforce orgin heuristics in glean_only mode
+        # ── Check 4: Origin heuristics (glean_only mode) ──────────────────
         if self.settings.auth_mode == "glean_only":
             if not self._check_request_origin(request):
                 logger.warning(
-                    "Rejected: Request failed origin heuristic check. "
-                    f"Client: {request.client.host}, "
-                    f"User-Agent: {request.headers.get('user-agent')}"
+                    f"Rejected (origin check failed): "
+                    f"client={request.client.host}, "
+                    f"user-agent={request.headers.get('user-agent')}"
                 )
-                return JSONResponse(
-                    status_code=403,
-                    content={"error": "Unauthorized origin"},
+                await self._send_json_response(
+                    send, status=403, body={"error": "Unauthorized origin"}
                 )
+                return
 
-        return await call_next(request)
+        # ── All checks passed — forward to application ─────────────────────
+        await self.app(scope, receive, send)
+
+    # ── Origin Heuristics ──────────────────────────────────────────────────
 
     def _check_request_origin(self, request: Request) -> bool:
         """
-        Verify the request likely comes from the allowed
-        Glean instance by checking available signals.
-
+        Verify the request likely comes from the allowed Glean instance.
         Checks (in order):
-        1. X-Forwarded-For / client IP patterns
-        2. User-Agent (Glean's backend uses Go-http-client)
-        3. Referer/Origin headers if present
+          1. User-Agent — Glean's backend uses Go-http-client
+          2. Origin / Referer headers (if present)
         """
-        # Check User-Agent — Glean's backend is a Go service
         user_agent = request.headers.get("user-agent", "")
         if "Go-http-client" not in user_agent:
-            logger.info(f"Non-Glean User-Agent: {user_agent}")
+            logger.info(f"Origin check: non-Glean User-Agent: '{user_agent}'")
             return False
 
-        # Check Origin/Referer if present
         origin = request.headers.get("origin", "")
         referer = request.headers.get("referer", "")
 
@@ -149,15 +169,12 @@ class GleanAuthMiddleware(BaseHTTPMiddleware):
 
         return True
 
+    # ── Token Validation ───────────────────────────────────────────────────
+
     async def _validate_token(self, token: str) -> bool:
         """
-        Validate the OAuth token by calling Bitbucket's
-        user endpoint. If the token is valid, Bitbucket
-        returns the user profile. If expired/revoked, 401.
-
-        This works because Glean obtained a Bitbucket OAuth
-        token via the Authorization URL/Token URL you
-        configured in the Glean admin console.
+        Validate the OAuth token by calling Bitbucket's /user endpoint.
+        Returns True if the token is valid, False otherwise.
         """
         try:
             response = await self._http.get(
@@ -167,7 +184,6 @@ class GleanAuthMiddleware(BaseHTTPMiddleware):
                     "Accept": "application/json",
                 },
             )
-
             if response.status_code == 200:
                 user_data = response.json()
                 logger.info(
@@ -175,16 +191,44 @@ class GleanAuthMiddleware(BaseHTTPMiddleware):
                     f"{user_data.get('display_name', 'unknown')}"
                 )
                 return True
-
-            logger.info(f"Token validation failed: " f"{response.status_code}")
+            logger.info(f"Token validation failed: HTTP {response.status_code}")
+            return False
+        except Exception:
+            logger.exception("Error during token validation against Bitbucket")
             return False
 
-        except Exception as e:
-            logger.exception("Error validating token")
-            return False
+    # ── ASGI Response Helper ───────────────────────────────────────────────
 
-    def _cleanup_cache(self):
-        """Remove expired entries from token cache."""
+    @staticmethod
+    async def _send_json_response(send: Send, status: int, body: dict) -> None:
+        """
+        Send a minimal JSON HTTP response directly via the ASGI send callable.
+        Used to reject requests before they reach the application.
+        Safe to use in pure ASGI middleware — no response buffering.
+        """
+        body_bytes = json.dumps(body).encode("utf-8")
+        await send(
+            {
+                "type": "http.response.start",
+                "status": status,
+                "headers": [
+                    [b"content-type", b"application/json"],
+                    [b"content-length", str(len(body_bytes)).encode()],
+                ],
+            }
+        )
+        await send(
+            {
+                "type": "http.response.body",
+                "body": body_bytes,
+                "more_body": False,
+            }
+        )
+
+    # ── Cache Maintenance ──────────────────────────────────────────────────
+
+    def _cleanup_cache(self) -> None:
+        """Evict expired entries when cache grows large."""
         if len(self._validated_tokens) > 500:
             now = time.time()
             self._validated_tokens = {

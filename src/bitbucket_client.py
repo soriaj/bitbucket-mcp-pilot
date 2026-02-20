@@ -2,17 +2,21 @@
 Bitbucket REST API client.
 
 Wraps the Bitbucket Cloud 2.0 API with typed methods for
-PR review operations.
+PR review operations. All methods validate inputs and handle
+errors gracefully.
 """
 
 import re
 import logging
 import httpx
 from typing import Any
+from urllib.parse import quote
+
 from src.auth import BitbucketAuth
 from src.config import get_settings
 
 logger = logging.getLogger(__name__)
+settings = get_settings()
 
 
 def _validate_slug(value: str, field_name: str) -> str:
@@ -26,6 +30,15 @@ def _validate_slug(value: str, field_name: str) -> str:
             "Only alphanumeric, dots, hyphens, and underscores allowed."
         )
     return value
+
+
+def _sanitize_text(value: str) -> str:
+    """
+    Strip carriage returns that appear in Bitbucket API
+    responses using Windows-style CRLF line endings. These encode as
+    %0D in URLs and cause malformed redirect targets.
+    """
+    return value.replace("\r", "").strip()
 
 
 class BitbucketClient:
@@ -118,11 +131,23 @@ class BitbucketClient:
             },
             follow_redirects=True,
         )
+        if response.status_code == 404:
+            raise ValueError(
+                f"PR #{pr_id} diff not found in {workspace}/{repo_slug}. "
+                "Check that the PR ID is correct and the PR is open."
+            )
+        if response.status_code == 403:
+            raise PermissionError(
+                "Insufficient permissions to read diff. "
+                "Ensure your OAuth token has 'pullrequest' read scope."
+            )
+
         response.raise_for_status()
 
+        diff_text = _sanitize_text(response.text)
+
         # Truncate very large diffs to avoid LLM context overflow
-        diff_text = response.text
-        max_chars = 100_000  # ~25k tokens
+        max_chars = settings.max_chars
         if len(diff_text) > max_chars:
             diff_text = diff_text[:max_chars] + (
                 "\n\n[DIFF TRUNCATED — too large for review. "
@@ -151,6 +176,73 @@ class BitbucketClient:
         )
         return result.get("values", [])
 
+    async def add_pull_request_comment(
+        self,
+        workspace: str,
+        repo_slug: str,
+        pr_id: int,
+        content: str,
+        inline_path: str | None = None,
+        inline_line: int | None = None,
+    ) -> dict:
+        """
+        Add a comment to a pull request.
+
+        Can be a general comment or an inline comment on a
+        specific file and line number.
+
+        Args:
+            content: Markdown-formatted comment text
+            inline_path: File path for inline comments
+            inline_line: Line number for inline comments (on the 'to' side)
+        """
+        workspace = _validate_slug(workspace, "workspace")
+        repo_slug = _validate_slug(repo_slug, "repo_slug")
+
+        body: dict[str, Any] = {"content": {"raw": content}}
+
+        # Add inline location if provided
+        if inline_path and inline_line:
+            body["inline"] = {
+                "path": inline_path,
+                "to": inline_line,
+            }
+
+        return await self._request(
+            "POST",
+            f"/repositories/{workspace}/{repo_slug}" f"/pullrequests/{pr_id}/comments",
+            json=body,
+        )
+
+    # ── PR Description Update ───────────────────────────────
+
+    async def update_pull_request_description(
+        self,
+        workspace: str,
+        repo_slug: str,
+        pr_id: int,
+        description: str,
+        title: str | None = None,
+    ) -> dict:
+        """
+        Update the PR description (and optionally title).
+
+        This is used to enrich the PR with context gathered
+        by the agent from Glean's enterprise knowledge.
+        """
+        workspace = _validate_slug(workspace, "workspace")
+        repo_slug = _validate_slug(repo_slug, "repo_slug")
+
+        body: dict[str, Any] = {"description": description}
+        if title:
+            body["title"] = title
+
+        return await self._request(
+            "PUT",
+            f"/repositories/{workspace}/{repo_slug}" f"/pullrequests/{pr_id}",
+            json=body,
+        )
+
     # ── File Contents ───────────────────────────────────────
 
     async def get_file_content(
@@ -170,13 +262,42 @@ class BitbucketClient:
         repo_slug = _validate_slug(repo_slug, "repo_slug")
 
         token = await self.auth.get_access_token()
+        # URL-encode the ref to safely handle branch names containing '/'
+        # e.g. 'feature/hello-world' → 'feature%2Fhello-world'
+        encoded_ref = quote(ref, safe="")
+
         response = await self._http.get(
             f"/repositories/{workspace}/{repo_slug}/src/{ref}/{file_path}",
             headers={"Authorization": f"Bearer {token}"},
             follow_redirects=True,
         )
+        if response.status_code == 404:
+            raise ValueError(
+                f"File '{file_path}' not found at ref '{ref}' "
+                f"in {workspace}/{repo_slug}. "
+                "Verify the branch name and file path from the PR diff. "
+                "Tip: use the PR source branch, not 'main', for changed files."
+            )
+        if response.status_code == 403:
+            raise PermissionError(
+                f"Cannot read '{file_path}' — check repository read permissions."
+            )
         response.raise_for_status()
         return response.text
+
+    # ── Helper: Get PR source branch ref ────────────────────────────────────
+    async def get_pr_source_ref(
+        self, workspace: str, repo_slug: str, pr_id: int
+    ) -> str:
+        """
+        Returns the source branch name of a PR.
+        Use this ref when calling get_file_content for files changed in the PR.
+        """
+        pr = await self.get_pull_request(workspace, repo_slug, pr_id)
+        branch = pr.get("source", {}).get("branch", {}).get("name", "")
+        commit = pr.get("source", {}).get("commit", {}).get("hash", "")
+        # Prefer commit hash (immutable) over branch name for precision
+        return _sanitize_text(commit or branch)
 
     async def close(self):
         """Cleanup HTTP clients."""

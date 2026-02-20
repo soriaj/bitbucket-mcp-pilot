@@ -28,6 +28,7 @@ class Settings(BaseSettings):
     # Security
     allowed_origins: str = ""
     log_level: str = "INFO"
+    max_chars: int = 300_000
 
     class Config:
         env_file = ".env"
