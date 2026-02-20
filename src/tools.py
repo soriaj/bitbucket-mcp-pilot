@@ -166,82 +166,7 @@ def create_mcp_server() -> Server:
                     },
                     "required": ["workspace", "repo_slug", "pr_id"],
                 },
-            ),
-            Tool(
-                name="add_pull_request_comment",
-                description=(
-                    "Add a review comment to a Bitbucket pull request. "
-                    "Can be a general comment or an inline comment on "
-                    "a specific file and line. Use this to post code "
-                    "review feedback, style guide violations, or "
-                    "improvement suggestions."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "workspace": {
-                            "type": "string",
-                            "description": "Bitbucket workspace slug",
-                        },
-                        "repo_slug": {
-                            "type": "string",
-                            "description": "Repository slug",
-                        },
-                        "pr_id": {
-                            "type": "integer",
-                            "description": "Pull request ID number",
-                        },
-                        "content": {
-                            "type": "string",
-                            "description": "Comment text in Markdown format",
-                        },
-                        "inline_path": {
-                            "type": "string",
-                            "description": "File path for inline comment (optional)",
-                        },
-                        "inline_line": {
-                            "type": "integer",
-                            "description": "Line number for inline comment (optional)",
-                        },
-                    },
-                    "required": ["workspace", "repo_slug", "pr_id", "content"],
-                },
-            ),
-            Tool(
-                name="update_pull_request_description",
-                description=(
-                    "Update the description (and optionally title) of "
-                    "a Bitbucket pull request. Use this to enrich the "
-                    "PR with contextual information from the codebase "
-                    "and documentation."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "workspace": {
-                            "type": "string",
-                            "description": "Bitbucket workspace slug",
-                        },
-                        "repo_slug": {
-                            "type": "string",
-                            "description": "Repository slug",
-                        },
-                        "pr_id": {
-                            "type": "integer",
-                            "description": "Pull request ID number",
-                        },
-                        "description": {
-                            "type": "string",
-                            "description": "New PR description in Markdown",
-                        },
-                        "title": {
-                            "type": "string",
-                            "description": "New PR title (optional)",
-                        },
-                    },
-                    "required": ["workspace", "repo_slug", "pr_id", "description"],
-                },
-            ),
+            )
         ]
 
     # ── Tool Execution ──────────────────────────────────────────────────────
@@ -361,38 +286,6 @@ def create_mcp_server() -> Server:
                     for c in comments
                 ]
                 return [TextContent(type="text", text=json.dumps(summary, indent=2))]
-
-            # ── add_pull_request_comment ──────────────────────────────────
-            elif name == "add_pull_request_comment":
-                result = await client.add_pull_request_comment(
-                    arguments["workspace"],
-                    arguments["repo_slug"],
-                    arguments["pr_id"],
-                    arguments["content"],
-                    arguments.get("inline_path"),
-                    arguments.get("inline_line"),
-                )
-                return [
-                    TextContent(
-                        type="text",
-                        text=f"Comment posted successfully. ID: {result.get('id')}",
-                    )
-                ]
-
-            # ── update_pull_request_description ──────────────────────────
-            elif name == "update_pull_request_description":
-                await client.update_pull_request_description(
-                    arguments["workspace"],
-                    arguments["repo_slug"],
-                    arguments["pr_id"],
-                    arguments["description"],
-                    arguments.get("title"),
-                )
-                return [
-                    TextContent(
-                        type="text", text="PR description updated successfully."
-                    )
-                ]
 
             # ── Unknown tool ──────────────────────────────────────────────
             else:
