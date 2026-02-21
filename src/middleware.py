@@ -150,24 +150,56 @@ class GleanAuthMiddleware:
         Checks (in order):
           1. User-Agent — Glean's backend uses Go-http-client
           2. Origin / Referer headers (if present)
+
+        Two Glean hosts must be allowed:
+        - support-lab-be.glean.com  → Go backend (tool execution)
+        - support-lab.glean.com     → Browser frontend (Agent Builder UI
+                                        tool saving/validation)
         """
         user_agent = request.headers.get("user-agent", "")
-        if "Go-http-client" not in user_agent:
-            logger.info(f"Origin check: non-Glean User-Agent: '{user_agent}'")
-            return False
-
         origin = request.headers.get("origin", "")
         referer = request.headers.get("referer", "")
 
-        if origin and self._allowed_glean_host:
-            if self._allowed_glean_host not in origin:
-                return False
+        # ── User-Agent: advisory signal only ─────────────────────────────────
+        # Log unexpected UAs for visibility but do NOT block on them.
+        if "Go-http-client" not in user_agent:
+            logger.info(
+                f"Non-Go-http-client User-Agent observed (allowed): '{user_agent}' "
+                f"from {request.client.host} → {request.method} {request.url.path}"
+            )
 
-        if referer and self._allowed_glean_host:
-            if self._allowed_glean_host not in referer:
-                return False
+            # ── Build allowed host list: both frontend and backend ────────────────
+            # self._allowed_glean_host = "support-lab-be.glean.com"  (backend)
+            # frontend host            = "support-lab.glean.com"     (Agent Builder UI)
+            allowed_hosts = []
+            if self._allowed_glean_host:
+                allowed_hosts.append(
+                    self._allowed_glean_host
+                )  # support-lab-be.glean.com
+            if self.settings.glean_instance:
+                allowed_hosts.append(
+                    f"{self.settings.glean_instance}.glean.com"
+                )  # support-lab.glean.com
 
-        return True
+            # ── Origin header: hard check only if present ─────────────────────────
+            if origin and allowed_hosts:
+                if not any(host in origin for host in allowed_hosts):
+                    logger.warning(
+                        f"Origin mismatch: got '{origin}', "
+                        f"expected one of: {allowed_hosts}"
+                    )
+                    return False
+
+            # ── Referer header: hard check only if present ────────────────────────
+            if referer and allowed_hosts:
+                if not any(host in referer for host in allowed_hosts):
+                    logger.warning(
+                        f"Referer mismatch: got '{referer}', "
+                        f"expected one of: {allowed_hosts}"
+                    )
+                    return False
+
+            return True
 
     # ── Token Validation ───────────────────────────────────────────────────
 
