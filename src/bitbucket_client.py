@@ -11,7 +11,7 @@ import logging
 import httpx
 from typing import Any
 from urllib.parse import quote
-
+import json
 from src.auth import BitbucketAuth
 from src.config import get_settings
 
@@ -39,6 +39,72 @@ def _sanitize_text(value: str) -> str:
     %0D in URLs and cause malformed redirect targets.
     """
     return value.replace("\r", "").strip()
+
+
+def _parse_diff_into_files(raw_diff: str) -> list[dict]:
+    """
+    Splits a unified diff into per-file sections and annotates each
+    with a change_type and fetchable flag so get_pull_request_diff
+    can guide the agent away from calling get_file_content on files
+    that don't exist at the source commit (deleted, binary, etc.).
+
+    change_type values:
+      added    → new file, exists at source commit     → fetchable
+      modified → existing file changed                 → fetchable
+      renamed  → moved/renamed, use new filename       → fetchable
+      deleted  → removed, does NOT exist at source     → NOT fetchable
+      binary   → image/compiled artifact, not text     → NOT fetchable
+    """
+    file_sections = re.split(r"(?=^diff --git )", raw_diff, flags=re.MULTILINE)
+    files = []
+
+    for section in file_sections:
+        if not section.strip():
+            continue
+
+        header = re.match(r"diff --git a/(.+?) b/(.+)", section)
+        if not header:
+            continue
+
+        old_path = header.group(1)
+        new_path = header.group(2)
+
+        # Determine change type from diff header markers
+        if "new file mode" in section:
+            change_type = "added"
+        elif "deleted file mode" in section:
+            change_type = "deleted"
+        elif "Binary files" in section or "GIT binary patch" in section:
+            change_type = "binary"
+        elif old_path != new_path:
+            change_type = "renamed"
+        else:
+            change_type = "modified"
+
+        additions = max(section.count("\n+") - section.count("\n+++"), 0)
+        deletions = max(section.count("\n-") - section.count("\n---"), 0)
+
+        files.append(
+            {
+                # Always use new_path — correct after renames, same as old for others
+                "filename": new_path,
+                "old_filename": old_path if change_type == "renamed" else None,
+                "change_type": change_type,
+                "additions": additions,
+                "deletions": deletions,
+                # fetchable=false means get_file_content WILL 404 — agent must skip
+                "fetchable": change_type in ("added", "modified", "renamed"),
+                "size_chars": len(section),
+                # Inline diff only for small files — avoids blowing context on large ones
+                "diff": (
+                    section
+                    if len(section) < 8_000
+                    else "[use get_file_content to fetch full diff]"
+                ),
+            }
+        )
+
+    return files
 
 
 class BitbucketClient:
@@ -116,8 +182,16 @@ class BitbucketClient:
         """
         Fetch the unified diff for a pull request.
 
-        Returns: Raw diff text showing all file changes.
-        This is what the LLM will analyze for code review.
+        Each file entry includes:
+          - filename      → path to use when calling get_file_content
+          - change_type   → added | modified | renamed | deleted | binary
+          - fetchable     → True if get_file_content can be called safely
+          - additions     → lines added
+          - deletions     → lines removed
+          - diff          → inline diff if small (<8k chars), else placeholder
+
+        The agent MUST check fetchable=true before calling get_file_content.
+        Deleted and binary files do not exist at the source commit and will 404.
         """
         workspace = _validate_slug(workspace, "workspace")
         repo_slug = _validate_slug(repo_slug, "repo_slug")
@@ -145,16 +219,33 @@ class BitbucketClient:
         response.raise_for_status()
 
         diff_text = _sanitize_text(response.text)
+        files = _parse_diff_into_files(diff_text)
+
+        manifest = {
+            "total_files_changed": len(files),
+            "total_additions": sum(f["additions"] for f in files),
+            "total_deletions": sum(f["deletions"] for f in files),
+            "note": (
+                "Only call get_file_content for files where fetchable=true. "
+                "Do NOT call it for deleted or binary files — they will 404."
+            ),
+            "files": files,
+        }
 
         # Truncate very large diffs to avoid LLM context overflow
         max_chars = settings.max_chars
-        if len(diff_text) > max_chars:
-            diff_text = diff_text[:max_chars] + (
-                "\n\n[DIFF TRUNCATED — too large for review. "
-                "Consider reviewing files individually.]"
+        manifest_text = json.dumps(manifest, indent=2)
+        if len(manifest_text) > max_chars:
+            while len(json.dumps(manifest, indent=2)) > max_chars and manifest["files"]:
+                manifest["files"].pop()
+            manifest["truncated"] = True
+            manifest["note"] += (
+                "\n\n[MANIFEST TRUNCATED — not all files shown. "
+                "Remaining files were removed to fit context limit."
             )
+            manifest_text = json.dumps(manifest, indent=2)
 
-        return diff_text
+        return manifest_text
 
     # ── PR Comments ─────────────────────────────────────────
 
@@ -175,7 +266,6 @@ class BitbucketClient:
             f"/repositories/{workspace}/{repo_slug}" f"/pullrequests/{pr_id}/comments",
         )
         return result.get("values", [])
-
 
     # ── File Contents ───────────────────────────────────────
 
@@ -201,16 +291,22 @@ class BitbucketClient:
         encoded_ref = quote(ref, safe="")
 
         response = await self._http.get(
-            f"/repositories/{workspace}/{repo_slug}/src/{ref}/{file_path}",
+            f"/repositories/{workspace}/{repo_slug}/src/{encoded_ref}/{file_path}",
             headers={"Authorization": f"Bearer {token}"},
             follow_redirects=True,
         )
         if response.status_code == 404:
-            raise ValueError(
-                f"File '{file_path}' not found at ref '{ref}' "
+            logger.warning(
+                f"File '{file_path}' not found at ref='{ref}' "
                 f"in {workspace}/{repo_slug}. "
                 "Verify the branch name and file path from the PR diff. "
-                "Tip: use the PR source branch, not 'main', for changed files."
+                "Likely delted, renamed, or binary."
+            )
+            return (
+                f"[FILE SKIPPED: '{file_path}' does not exist at ref '{ref}'. "
+                f"Possible reasons: file was deleted, renamed (check 'old_filename' "
+                f"in the diff manifest for the new path), or is a binary file. "
+                f"Continue reviewing the remaining files.]"
             )
         if response.status_code == 403:
             raise PermissionError(

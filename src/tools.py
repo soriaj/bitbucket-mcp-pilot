@@ -98,12 +98,9 @@ def create_mcp_server() -> Server:
                     "Read the content of a file from a Bitbucket repository. "
                     "Useful for fetching style guides, linting configurations, "
                     "CONTRIBUTING.md, or any file changed in the PR. "
-                    "IMPORTANT: For files changed in a PR, always pass the "
-                    "'source_commit' value from get_pull_request as 'ref' — "
-                    "do NOT use 'main' for changed files, as they may not "
-                    "exist on the main branch yet. "
-                    "Optionally pass 'pr_id' to let the server auto-resolve "
-                    "the correct source branch ref if 'ref' is unknown."
+                    "ALWAYS pass pr_id when reading files changed in a PR — "
+                    "the server will automatically resolve the correct source "
+                    "commit as the ref. Do NOT pass a ref parameter for PR files."
                 ),
                 inputSchema={
                     "type": "object",
@@ -118,23 +115,22 @@ def create_mcp_server() -> Server:
                         },
                         "file_path": {
                             "type": "string",
-                            "description": "Path to the file in the repository (e.g. 'src/hello.py')",
-                        },
-                        "ref": {
-                            "type": "string",
-                            "description": (
-                                "Branch name or commit hash to read the file from. "
-                                "Use 'source_commit' from get_pull_request for PR files. "
-                                "Use 'main' only for files that exist on main (e.g. style guides). "
-                                "If omitted, the server will attempt to auto-resolve from pr_id."
-                            ),
+                            "description": "Path to the file (e.g. 'src/hello.py')",
                         },
                         "pr_id": {
                             "type": "integer",
                             "description": (
-                                "Optional PR ID. When provided and 'ref' is absent or 'main', "
-                                "the server auto-resolves the PR source commit as the ref. "
-                                "Recommended when reading files changed in the PR."
+                                "PR ID — when provided, the server auto-resolves "
+                                "the correct source commit as the ref. Always pass "
+                                "this when reading files changed in the PR."
+                            ),
+                        },
+                        "ref": {
+                            "type": "string",
+                            "description": (
+                                "Branch or commit ref. Only use this for files on "
+                                "main that are NOT part of the PR (e.g. style guides). "
+                                "For PR files, pass pr_id instead and omit this field."
                             ),
                         },
                     },
@@ -166,7 +162,82 @@ def create_mcp_server() -> Server:
                     },
                     "required": ["workspace", "repo_slug", "pr_id"],
                 },
-            )
+            ),
+            Tool(
+                name="add_pull_request_comment",
+                description=(
+                    "Add a review comment to a Bitbucket pull request. "
+                    "Can be a general comment or an inline comment on "
+                    "a specific file and line. Use this to post code "
+                    "review feedback, style guide violations, or "
+                    "improvement suggestions."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "workspace": {
+                            "type": "string",
+                            "description": "Bitbucket workspace slug",
+                        },
+                        "repo_slug": {
+                            "type": "string",
+                            "description": "Repository slug",
+                        },
+                        "pr_id": {
+                            "type": "integer",
+                            "description": "Pull request ID number",
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "Comment text in Markdown format",
+                        },
+                        "inline_path": {
+                            "type": "string",
+                            "description": "File path for inline comment (optional)",
+                        },
+                        "inline_line": {
+                            "type": "integer",
+                            "description": "Line number for inline comment (optional)",
+                        },
+                    },
+                    "required": ["workspace", "repo_slug", "pr_id", "content"],
+                },
+            ),
+            Tool(
+                name="update_pull_request_description",
+                description=(
+                    "Update the description (and optionally title) of "
+                    "a Bitbucket pull request. Use this to enrich the "
+                    "PR with contextual information from the codebase "
+                    "and documentation."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "workspace": {
+                            "type": "string",
+                            "description": "Bitbucket workspace slug",
+                        },
+                        "repo_slug": {
+                            "type": "string",
+                            "description": "Repository slug",
+                        },
+                        "pr_id": {
+                            "type": "integer",
+                            "description": "Pull request ID number",
+                        },
+                        "description": {
+                            "type": "string",
+                            "description": "New PR description in Markdown",
+                        },
+                        "title": {
+                            "type": "string",
+                            "description": "New PR title (optional)",
+                        },
+                    },
+                    "required": ["workspace", "repo_slug", "pr_id", "description"],
+                },
+            ),
         ]
 
     # ── Tool Execution ──────────────────────────────────────────────────────
@@ -236,20 +307,33 @@ def create_mcp_server() -> Server:
                 ref = arguments.get("ref")
                 pr_id = arguments.get("pr_id")
 
-                # FIX Bug 2b: Smart ref resolution.
-                # If ref is absent or still "main" AND a pr_id was given,
-                # auto-resolve the PR's source commit hash as the ref.
-                # This handles files that only exist on the feature branch.
-                if (not ref or ref == "main") and pr_id:
+                INVALID_REFS = {
+                    None,
+                    "",
+                    "main",
+                    "source_commit",  # ← agent passes field name instead of value
+                    "source_branch",  # ← other common literal placeholders
+                    "commit_hash",
+                    "branch_name",
+                    "ref",
+                }
+
+                if pr_id:
                     try:
                         resolved_ref = await client.get_pr_source_ref(
                             workspace, repo_slug, int(pr_id)
                         )
                         if resolved_ref:
-                            logger.info(
-                                f"Auto-resolved ref for get_file_content: "
-                                f"'{ref}' → '{resolved_ref}' (from PR #{pr_id})"
-                            )
+                            if ref in INVALID_REFS:
+                                logger.info(
+                                    f"Ref='{ref}' is a placeholder — overriding with "
+                                    f"PR #{pr_id} source commit: '{resolved_ref}'"
+                                )
+                            else:
+                                logger.info(
+                                    f"pr_id provided — using PR #{pr_id} source "
+                                    f"commit '{resolved_ref}' (agent passed ref='{ref}')"
+                                )
                             ref = resolved_ref
                     except Exception as ref_err:
                         logger.warning(
@@ -257,8 +341,9 @@ def create_mcp_server() -> Server:
                             f"Falling back to ref='{ref or 'main'}'"
                         )
 
-                # Final fallback
-                ref = ref or "main"
+                # Final fallback — only reached if no pr_id was provided
+                if ref in INVALID_REFS:
+                    ref = "main"
 
                 content = await client.get_file_content(
                     workspace,
@@ -286,6 +371,38 @@ def create_mcp_server() -> Server:
                     for c in comments
                 ]
                 return [TextContent(type="text", text=json.dumps(summary, indent=2))]
+
+            # ── add_pull_request_comment ──────────────────────────────────
+            elif name == "add_pull_request_comment":
+                result = await client.add_pull_request_comment(
+                    arguments["workspace"],
+                    arguments["repo_slug"],
+                    arguments["pr_id"],
+                    arguments["content"],
+                    arguments.get("inline_path"),
+                    arguments.get("inline_line"),
+                )
+                return [
+                    TextContent(
+                        type="text",
+                        text=f"Comment posted successfully. ID: {result.get('id')}",
+                    )
+                ]
+
+            # ── update_pull_request_description ──────────────────────────
+            elif name == "update_pull_request_description":
+                await client.update_pull_request_description(
+                    arguments["workspace"],
+                    arguments["repo_slug"],
+                    arguments["pr_id"],
+                    arguments["description"],
+                    arguments.get("title"),
+                )
+                return [
+                    TextContent(
+                        type="text", text="PR description updated successfully."
+                    )
+                ]
 
             # ── Unknown tool ──────────────────────────────────────────────
             else:

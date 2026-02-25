@@ -130,12 +130,20 @@ class GleanAuthMiddleware:
         if self.settings.auth_mode == "glean_only":
             if not self._check_request_origin(request):
                 logger.warning(
-                    f"Rejected (origin check failed): "
+                    "Rejected (origin check failed): "
                     f"client={request.client.host}, "
-                    f"user-agent={request.headers.get('user-agent')}"
+                    f"user-agent={request.headers.get('user-agent')}, "
+                    f"origin={request.headers.get('origin')}, "
+                    f"referrer={request.headers.get('referer')}"
                 )
                 await self._send_json_response(
-                    send, status=403, body={"error": "Unauthorized origin"}
+                    send,
+                    status=403,
+                    body={
+                        "error": "Unauthorized origin",
+                        "origin": request.headers.get("origin"),
+                        "referrer": request.headers.get("referrer"),
+                    },
                 )
                 return
 

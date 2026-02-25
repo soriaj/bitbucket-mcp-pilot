@@ -120,6 +120,16 @@ def create_app() -> Starlette:
         o.strip() for o in settings.allowed_origins.split(",") if o.strip()
     ] or ["*"]
 
+    if not allowed_origins and settings.glean_instance:
+        allowed_origins = [
+            f"https://{settings.glean_instance}.glean.com",
+            f"https://{settings.glean_instance}-be.glean.com",
+        ]
+
+    # Final fallback — open CORS for local dev (auth_mode=none only)
+    if not allowed_origins:
+        allowed_origins = ["*"]
+
     starlette_app = Starlette(
         routes=[
             Route("/health", health_check),
