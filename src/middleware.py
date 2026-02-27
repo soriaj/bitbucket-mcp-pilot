@@ -166,7 +166,7 @@ class GleanAuthMiddleware:
 
         # ── User-Agent: advisory signal only ─────────────────────────────────
         # Log unexpected UAs for visibility but do NOT block on them.
-        if "Go-http-client" in user_agent:
+        if "Glean-MCP-Client" in user_agent or "Go-http-client" in user_agent:
             logger.info(
                 f"ORIGIN_DIAGNOSTIC | PASS (Go-http-client backend) | "
                 f"method={request.method} path={request.url.path}"
