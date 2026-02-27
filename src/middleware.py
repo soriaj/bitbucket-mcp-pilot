@@ -170,6 +170,8 @@ class GleanAuthMiddleware:
             logger.info(
                 f"ORIGIN_DIAGNOSTIC | PASS (Go-http-client backend) | "
                 f"method={request.method} path={request.url.path}"
+                f"origin='{origin or 'NOT SET'}' | "
+                f"referer='{referer or 'NOT SET'}'"
             )
             return True
 
