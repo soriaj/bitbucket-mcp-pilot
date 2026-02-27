@@ -95,17 +95,13 @@ class GleanAuthMiddleware:
             return
 
         # ── Check 3: Token validation (with cache) ────────────────────────
-        token_hash = hashlib.sha256(token.encode()).hexdigest()[
-            :32
-        ]  # 32 chars for safety
+        token_hash = hashlib.sha256(token.encode()).hexdigest()[:32]
         now = time.time()
 
         if token_hash in self._validated_tokens:
             if now < self._validated_tokens[token_hash]:
-                # Cache hit — skip Bitbucket API call
-                pass
+                pass  # cache hit — skip Bitbucket API call
             else:
-                # Expired — remove and re-validate
                 del self._validated_tokens[token_hash]
                 if not await self._validate_token(token):
                     logger.warning(f"Rejected (expired token): {request.client.host}")
@@ -130,11 +126,11 @@ class GleanAuthMiddleware:
         if self.settings.auth_mode == "glean_only":
             if not self._check_request_origin(request):
                 logger.warning(
-                    "Rejected (origin check failed): "
+                    f"Rejected (origin check failed): "
                     f"client={request.client.host}, "
                     f"user-agent={request.headers.get('user-agent')}, "
                     f"origin={request.headers.get('origin')}, "
-                    f"referrer={request.headers.get('referer')}"
+                    f"referer={request.headers.get('referer')}"
                 )
                 await self._send_json_response(
                     send,
@@ -142,7 +138,7 @@ class GleanAuthMiddleware:
                     body={
                         "error": "Unauthorized origin",
                         "origin": request.headers.get("origin"),
-                        "referrer": request.headers.get("referrer"),
+                        "referer": request.headers.get("referer"),
                     },
                 )
                 return
@@ -170,44 +166,54 @@ class GleanAuthMiddleware:
 
         # ── User-Agent: advisory signal only ─────────────────────────────────
         # Log unexpected UAs for visibility but do NOT block on them.
-        if "Go-http-client" not in user_agent:
+        if "Go-http-client" in user_agent:
             logger.info(
-                f"Non-Go-http-client User-Agent observed (allowed): '{user_agent}' "
-                f"from {request.client.host} → {request.method} {request.url.path}"
+                f"ORIGIN_DIAGNOSTIC | PASS (Go-http-client backend) | "
+                f"method={request.method} path={request.url.path}"
             )
-
-            # ── Build allowed host list: both frontend and backend ────────────────
-            # self._allowed_glean_host = "support-lab-be.glean.com"  (backend)
-            # frontend host            = "support-lab.glean.com"     (Agent Builder UI)
-            allowed_hosts = []
-            if self._allowed_glean_host:
-                allowed_hosts.append(
-                    self._allowed_glean_host
-                )  # support-lab-be.glean.com
-            if self.settings.glean_instance:
-                allowed_hosts.append(
-                    f"{self.settings.glean_instance}.glean.com"
-                )  # support-lab.glean.com
-
-            # ── Origin header: hard check only if present ─────────────────────────
-            if origin and allowed_hosts:
-                if not any(host in origin for host in allowed_hosts):
-                    logger.warning(
-                        f"Origin mismatch: got '{origin}', "
-                        f"expected one of: {allowed_hosts}"
-                    )
-                    return False
-
-            # ── Referer header: hard check only if present ────────────────────────
-            if referer and allowed_hosts:
-                if not any(host in referer for host in allowed_hosts):
-                    logger.warning(
-                        f"Referer mismatch: got '{referer}', "
-                        f"expected one of: {allowed_hosts}"
-                    )
-                    return False
-
             return True
+
+        # Log the UA for visibility — not a block condition.
+        logger.info(
+            f"Non-Go-http-client UA (allowed): '{user_agent}' "
+            f"from {request.client.host} "
+            f"→ {request.method} {request.url.path}"
+        )
+
+        # ── Build allowed host list: both frontend and backend ────────────────
+        # self._allowed_glean_host = "support-lab-be.glean.com"  (backend)
+        # frontend host            = "support-lab.glean.com"     (Agent Builder UI)
+        allowed_hosts = []
+        if self._allowed_glean_host:
+            # support-lab-be.glean.com
+            allowed_hosts.append(self._allowed_glean_host)
+        if self.settings.glean_instance:
+            # support-lab.glean.com
+            allowed_hosts.append(f"{self.settings.glean_instance}.glean.com")
+
+        # ── Origin header: hard check only if present ─────────────────────────
+        if origin and allowed_hosts:
+            if not any(host in origin for host in allowed_hosts):
+                logger.warning(f"Origin mismatch: '{origin}' not in {allowed_hosts}")
+                return False
+
+        # ── Referer header: hard check only if present ────────────────────────
+        if referer and allowed_hosts:
+            if not any(host in referer for host in allowed_hosts):
+                logger.warning(f"Referer mismatch: '{referer}' not in {allowed_hosts}")
+                return False
+
+        logger.info(
+            f"ORIGIN_DIAGNOSTIC | "
+            f"method={request.method} path={request.url.path} | "
+            f"origin='{origin or 'NOT SET'}' | "
+            f"referer='{referer or 'NOT SET'}' | "
+            f"user-agent='{user_agent[:80]}' | "
+            f"allowed_hosts={allowed_hosts} | "
+            f"result=PASS"
+        )
+
+        return True
 
     # ── Token Validation ───────────────────────────────────────────────────
 
